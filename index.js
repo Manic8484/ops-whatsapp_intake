@@ -6,15 +6,6 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken = process.env.TWILIO_AUTH_TOKEN;
-
-const client = twilio(accountSid, authToken);
-
-app.get("/", (req, res) => {
-  res.status(200).send("WhatsApp intake running");
-});
-
 function extractWhRef(text) {
   if (!text) return null;
 
@@ -25,37 +16,11 @@ function extractWhRef(text) {
   return `WH-${match[1]}`;
 }
 
-app.post("/webhooks/whatsapp", async (req, res) => {
+app.post("/webhooks/whatsapp", (req, res) => {
   console.log("=== WhatsApp webhook received ===");
   console.log(JSON.stringify(req.body, null, 2));
 
-  const {
-    MessageSid,
-    From,
-    To,
-    Body,
-    NumMedia,
-    ProfileName,
-    WaId,
-    MessageType,
-    Forwarded,
-    FrequentlyForwarded
-  } = req.body;
-
-  console.log({
-    MessageSid,
-    From,
-    To,
-    Body,
-    NumMedia,
-    ProfileName,
-    WaId,
-    MessageType,
-    Forwarded,
-    FrequentlyForwarded
-  });
-
-  const whRef = extractWhRef(Body);
+  const whRef = extractWhRef(req.body.Body);
 
   let reply;
 
@@ -69,31 +34,18 @@ app.post("/webhooks/whatsapp", async (req, res) => {
       "Please send one, for example WH-123.";
   }
 
+  const twiml = new twilio.twiml.MessagingResponse();
+  twiml.message(reply);
+
+  const xml = twiml.toString();
+
   console.log("Bot reply:", reply);
+  console.log("TwiML response:", xml);
 
-  try {
-    const outbound = await client.messages.create({
-      from: To,
-      to: From,
-      body: reply
-    });
-
-    console.log("Outbound WhatsApp sent:", {
-      sid: outbound.sid,
-      status: outbound.status,
-      from: To,
-      to: From
-    });
-  } catch (err) {
-    console.error("Outbound WhatsApp failed:", {
-      message: err.message,
-      code: err.code,
-      status: err.status
-    });
-  }
-
-  // We've handled the reply ourselves, so just acknowledge Twilio.
-  res.status(200).send("OK");
+  res
+    .status(200)
+    .type("text/xml")
+    .send(xml);
 });
 
 const port = process.env.PORT || 8080;
