@@ -1,9 +1,15 @@
 import express from "express";
+import twilio from "twilio";
 
 const app = express();
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+const accountSid = process.env.TWILIO_ACCOUNT_SID;
+const authToken = process.env.TWILIO_AUTH_TOKEN;
+
+const client = twilio(accountSid, authToken);
 
 app.get("/", (req, res) => {
   res.status(200).send("WhatsApp intake running");
@@ -12,11 +18,6 @@ app.get("/", (req, res) => {
 function extractWhRef(text) {
   if (!text) return null;
 
-  // Accept examples such as:
-  // WH-123
-  // WH123
-  // WH 123
-  // wh-123
   const match = text.match(/\bWH[\s-]?(\d+)\b/i);
 
   if (!match) return null;
@@ -24,16 +25,7 @@ function extractWhRef(text) {
   return `WH-${match[1]}`;
 }
 
-function escapeXml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;");
-}
-
-app.post("/webhooks/whatsapp", (req, res) => {
+app.post("/webhooks/whatsapp", async (req, res) => {
   console.log("=== WhatsApp webhook received ===");
   console.log(JSON.stringify(req.body, null, 2));
 
@@ -79,13 +71,29 @@ app.post("/webhooks/whatsapp", (req, res) => {
 
   console.log("Bot reply:", reply);
 
-  const twiml =
-    `<?xml version="1.0" encoding="UTF-8"?>` +
-    `<Response>` +
-    `<Message>${escapeXml(reply)}</Message>` +
-    `</Response>`;
+  try {
+    const outbound = await client.messages.create({
+      from: To,
+      to: From,
+      body: reply
+    });
 
-  res.status(200).type("text/xml").send(twiml);
+    console.log("Outbound WhatsApp sent:", {
+      sid: outbound.sid,
+      status: outbound.status,
+      from: To,
+      to: From
+    });
+  } catch (err) {
+    console.error("Outbound WhatsApp failed:", {
+      message: err.message,
+      code: err.code,
+      status: err.status
+    });
+  }
+
+  // We've handled the reply ourselves, so just acknowledge Twilio.
+  res.status(200).send("OK");
 });
 
 const port = process.env.PORT || 8080;
