@@ -43,14 +43,7 @@ const mediaBucketName =
 
 const mediaBucket = storage.bucket(mediaBucketName);
 
-const twilioApiKeySid = process.env.TWILIO_API_KEY_SID;
-const twilioApiKeySecret = process.env.TWILIO_API_KEY_SECRET;
-console.log("Twilio media auth config:", {
-  apiKeySidPresent: Boolean(twilioApiKeySid),
-  apiKeySidPrefix: twilioApiKeySid
-    ? twilioApiKeySid.substring(0, 2)
-    : null,
-  apiKeySecretPresent: Boolean(twilioApiKeySecret)
+
 });
 
 
