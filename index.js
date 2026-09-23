@@ -166,7 +166,82 @@ async function getActiveWhatsappSession(waId) {
 
   return result.rows[0] || null;
 }
+async function storeMessage({
+  sourceType,
+  provider,
+  externalMessageId,
+  sourceUserId,
+  sourceDisplayName,
+  messageType,
+  messageText,
+  isForwarded,
+  rawPayload
+}) {
+  const result = await operationsDb.query(
+    `
+      INSERT INTO comms.message
+      (
+        source_type,
+        provider,
+        external_message_id,
+        source_user_id,
+        source_display_name,
+        message_type,
+        message_text,
+        is_forwarded,
+        raw_payload
+      )
+      VALUES
+      (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9
+      )
+      ON CONFLICT (source_type, provider, external_message_id)
+      DO UPDATE SET
+        message_text        = EXCLUDED.message_text,
+        source_display_name = EXCLUDED.source_display_name,
+        is_forwarded        = EXCLUDED.is_forwarded,
+        raw_payload         = EXCLUDED.raw_payload
+      RETURNING message_id
+    `,
+    [
+      sourceType,
+      provider,
+      externalMessageId,
+      sourceUserId,
+      sourceDisplayName,
+      messageType,
+      messageText || null,
+      isForwarded,
+      rawPayload
+    ]
+  );
 
+  return result.rows[0].message_id;
+}
+
+
+async function linkMessageToEntity(messageId, entityType, entityRef, linkedBy) {
+  await operationsDb.query(
+    `
+      INSERT INTO comms.message_link
+      (
+        message_id,
+        entity_type,
+        entity_ref,
+        linked_by
+      )
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (message_id, entity_type, entity_ref)
+      DO NOTHING
+    `,
+    [
+      messageId,
+      entityType,
+      entityRef,
+      linkedBy
+    ]
+  );
+}
 
 // ----------------------------------------------------
 // HEALTH CHECK
@@ -296,26 +371,50 @@ app.post("/webhooks/whatsapp", async (req, res) => {
 
     if (activeSession) {
 
-      console.log(
-        `Active session: ${activeSession.entity_ref}`
-      );
+  const messageId = await storeMessage({
+    sourceType: "WHATSAPP",
+    provider: "TWILIO",
+    externalMessageId: MessageSid,
+    sourceUserId: WaId,
+    sourceDisplayName: ProfileName,
+    messageType: MessageType,
+    messageText: Body,
+    isForwarded:
+      Forwarded === "true"
+        ? true
+        : Forwarded === "false"
+        ? false
+        : null,
+    rawPayload: req.body
+  });
 
-      /*
-        We are NOT storing the incoming message yet.
+  await linkMessageToEntity(
+    messageId,
+    activeSession.entity_type,
+    activeSession.entity_ref,
+    WaId
+  );
 
-        This branch simply proves that OpsBot remembers
-        the selected WH between webhook calls.
-      */
+  await operationsDb.query(
+    `
+      UPDATE comms.session
+      SET
+        last_activity_ts = now(),
+        expires_ts = now() + interval '30 minutes'
+      WHERE session_id = $1
+    `,
+    [activeSession.session_id]
+  );
 
-      const reply = makeReply(
-        `${activeSession.entity_ref} is currently selected.`
-      );
+  const reply = makeReply(
+    `${activeSession.entity_ref}: message saved.`
+  );
 
-      return res
-        .status(200)
-        .type("text/xml")
-        .send(reply);
-    }
+  return res
+    .status(200)
+    .type("text/xml")
+    .send(reply);
+}
 
 
     // ------------------------------------------------
