@@ -674,7 +674,7 @@ if (storedMedia.length > 0) {
 }
 
 console.log(
-  `Saved to ${activeSession.entity_ref}:`,
+  `Saved to ${whRef}:`,
   {
     messageId,
     mediaCount: storedMedia.length,
@@ -682,17 +682,12 @@ console.log(
   }
 );
 
-// No WhatsApp acknowledgement for ordinary content.
-// Returning empty TwiML prevents OpsBot flooding the chat
-// when several forwarded images arrive separately.
+const reply = makeReply(acknowledgement);
 
 return res
   .status(200)
   .type("text/xml")
-  .send(
-    new twilio.twiml.MessagingResponse()
-      .toString()
-  );
+  .send(reply);
 
 
     // ------------------------------------------------
@@ -745,23 +740,25 @@ return res
     [activeSession.session_id]
   );
 
- let acknowledgement =
-  `${activeSession.entity_ref}: message saved.`;
+  console.log(
+    `Saved to ${activeSession.entity_ref}:`,
+    {
+      messageId,
+      mediaCount: storedMedia.length,
+      messageType: MessageType
+    }
+  );
 
-if (storedMedia.length > 0) {
-  acknowledgement =
-    `${activeSession.entity_ref}: ` +
-    `${storedMedia.length} media item` +
-    `${storedMedia.length === 1 ? "" : "s"} saved.`;
-}
-
-const reply =
-  makeReply(acknowledgement);
-
+  // No WhatsApp acknowledgement for ordinary content.
+  // Returning empty TwiML prevents OpsBot flooding the chat
+  // when several forwarded images arrive separately.
   return res
     .status(200)
     .type("text/xml")
-    .send(reply);
+    .send(
+      new twilio.twiml.MessagingResponse()
+        .toString()
+    );
 }
 
 
