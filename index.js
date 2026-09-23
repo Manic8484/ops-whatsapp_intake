@@ -90,9 +90,11 @@ async function findWarehouseRef(whRef) {
 
   const result = await warehouseDb.query(
     `
-      SELECT wh_id
+      SELECT
+          wh_id,
+          wh_ref
       FROM public.v_wh_detail
-      WHERE wh_id = $1
+      WHERE upper(wh_ref) = upper($1)
       LIMIT 1
     `,
     [whRef]
