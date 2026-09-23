@@ -689,6 +689,8 @@ return res
   .type("text/xml")
   .send(reply);
 
+    }
+
 
     // ------------------------------------------------
     // 5. NO WH IN MESSAGE - CHECK EXISTING SESSION
