@@ -45,6 +45,13 @@ const mediaBucket = storage.bucket(mediaBucketName);
 
 const twilioApiKeySid = process.env.TWILIO_API_KEY_SID;
 const twilioApiKeySecret = process.env.TWILIO_API_KEY_SECRET;
+console.log("Twilio media auth config:", {
+  apiKeySidPresent: Boolean(twilioApiKeySid),
+  apiKeySidPrefix: twilioApiKeySid
+    ? twilioApiKeySid.substring(0, 2)
+    : null,
+  apiKeySecretPresent: Boolean(twilioApiKeySecret)
+});
 
 
 // ----------------------------------------------------
@@ -586,14 +593,72 @@ app.post("/webhooks/whatsapp", async (req, res) => {
 const hasOperationalContent =
   hasMedia || !isBareWhSelector(Body);
 
-      const reply = makeReply(
-        `${whRef} selected. Send or forward messages, photos or documents for this consignment.`
-      );
 
-      return res
-        .status(200)
-        .type("text/xml")
-        .send(reply);
+// Bare "WH-123" is only a selector.
+if (!hasOperationalContent) {
+
+  const reply = makeReply(
+    `${whRef} selected. Send or forward messages, photos or documents for this consignment.`
+  );
+
+  return res
+    .status(200)
+    .type("text/xml")
+    .send(reply);
+}
+
+
+// WH reference plus text/media:
+// select the WH AND save the content.
+
+const messageId = await storeMessage({
+  sourceType: "WHATSAPP",
+  provider: "TWILIO",
+  externalMessageId: MessageSid,
+  sourceUserId: WaId,
+  sourceDisplayName: ProfileName,
+  messageType: MessageType,
+  messageText: Body,
+  isForwarded:
+    Forwarded === "true"
+      ? true
+      : Forwarded === "false"
+      ? false
+      : null,
+  rawPayload: req.body
+});
+
+await linkMessageToEntity(
+  messageId,
+  "WH",
+  whRef,
+  WaId
+);
+
+const storedMedia =
+  await storeMediaForMessage(
+    messageId,
+    req.body
+  );
+
+let acknowledgement;
+
+if (storedMedia.length > 0) {
+  acknowledgement =
+    `${whRef}: ${storedMedia.length} media item` +
+    `${storedMedia.length === 1 ? "" : "s"} saved.`;
+} else {
+  acknowledgement =
+    `${whRef}: message saved.`;
+}
+
+const reply =
+  makeReply(acknowledgement);
+
+return res
+  .status(200)
+  .type("text/xml")
+  .send(reply);
     }
 
 
