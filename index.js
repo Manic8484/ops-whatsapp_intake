@@ -1,6 +1,8 @@
 import express from "express";
 import pg from "pg";
 import twilio from "twilio";
+import { Storage } from "@google-cloud/storage";
+import crypto from "crypto";
 
 const { Pool } = pg;
 
@@ -34,6 +36,16 @@ const warehouseDb = new Pool({
   database: "warehouse"
 });
 
+const storage = new Storage();
+
+const mediaBucketName =
+  process.env.OPERATIONS_MEDIA_BUCKET || "operations-media";
+
+const mediaBucket = storage.bucket(mediaBucketName);
+
+const twilioApiKeySid = process.env.TWILIO_API_KEY_SID;
+const twilioApiKeySecret = process.env.TWILIO_API_KEY_SECRET;
+
 
 // ----------------------------------------------------
 // HELPERS
@@ -64,6 +76,226 @@ function makeReply(text) {
   return response.toString();
 }
 
+function mediaIdFromUrl(url) {
+  if (!url) return null;
+
+  const parts = url.split("/");
+  return parts[parts.length - 1] || null;
+}
+
+
+function extensionForMimeType(mimeType) {
+  const extensions = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+
+    "application/pdf": ".pdf",
+
+    "audio/ogg": ".ogg",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+
+    "video/mp4": ".mp4",
+
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+      ".docx",
+
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+      ".xlsx"
+  };
+
+  return extensions[mimeType] || "";
+}
+
+function isBareWhSelector(text) {
+
+  if (!text) return false;
+
+  const remainder = text
+    .replace(/\bWH[\s-]?\d+\b/i, "")
+    .replace(/[\s:;,.\-–—]+/g, "")
+    .trim();
+
+  return remainder.length === 0;
+}
+
+async function downloadTwilioMedia(mediaUrl) {
+
+  const credentials = Buffer.from(
+    `${twilioApiKeySid}:${twilioApiKeySecret}`
+  ).toString("base64");
+
+  const response = await fetch(mediaUrl, {
+    headers: {
+      Authorization: `Basic ${credentials}`
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Twilio media download failed: ${response.status} ${response.statusText}`
+    );
+  }
+
+  const buffer =
+    Buffer.from(await response.arrayBuffer());
+
+  return buffer;
+}
+
+async function storeMediaForMessage(messageId, reqBody) {
+
+  const numMedia =
+    Number(reqBody.NumMedia || 0);
+
+  const stored = [];
+
+  for (let i = 0; i < numMedia; i++) {
+
+    const mediaUrl =
+      reqBody[`MediaUrl${i}`];
+
+    const mimeType =
+      reqBody[`MediaContentType${i}`] ||
+      "application/octet-stream";
+
+    if (!mediaUrl) {
+      continue;
+    }
+
+    const externalMediaId =
+      mediaIdFromUrl(mediaUrl);
+
+    // Has this Twilio media item already been stored?
+    const existing =
+      await operationsDb.query(
+        `
+          SELECT
+              media_id,
+              storage_path
+          FROM comms.media
+          WHERE message_id = $1
+            AND external_media_id = $2
+          LIMIT 1
+        `,
+        [
+          messageId,
+          externalMediaId
+        ]
+      );
+
+    if (existing.rows[0]) {
+
+      console.log(
+        `Media already stored: ${externalMediaId}`
+      );
+
+      stored.push(existing.rows[0]);
+
+      continue;
+    }
+
+
+    const mediaId =
+      crypto.randomUUID();
+
+    const now =
+      new Date();
+
+    const year =
+      now.getUTCFullYear();
+
+    const month =
+      String(now.getUTCMonth() + 1)
+        .padStart(2, "0");
+
+    const extension =
+      extensionForMimeType(mimeType);
+
+    const storagePath =
+      `whatsapp/${year}/${month}/${messageId}/${mediaId}${extension}`;
+
+
+    console.log(
+      `Downloading Twilio media: ${externalMediaId}`
+    );
+
+    const contents =
+      await downloadTwilioMedia(mediaUrl);
+
+
+    console.log(
+      `Saving media to gs://${mediaBucketName}/${storagePath}`
+    );
+
+    await mediaBucket
+      .file(storagePath)
+      .save(contents, {
+        resumable: false,
+        contentType: mimeType,
+        metadata: {
+          contentType: mimeType,
+          metadata: {
+            source: "WHATSAPP",
+            provider: "TWILIO",
+            externalMediaId:
+              externalMediaId || ""
+          }
+        }
+      });
+
+
+    const result =
+      await operationsDb.query(
+        `
+          INSERT INTO comms.media
+          (
+              media_id,
+              message_id,
+              external_media_id,
+              mime_type,
+              storage_path
+          )
+          VALUES
+          (
+              $1,
+              $2,
+              $3,
+              $4,
+              $5
+          )
+
+          ON CONFLICT
+              (message_id, external_media_id)
+          DO NOTHING
+
+          RETURNING
+              media_id,
+              storage_path
+        `,
+        [
+          mediaId,
+          messageId,
+          externalMediaId,
+          mimeType,
+          storagePath
+        ]
+      );
+
+    stored.push(
+      result.rows[0] || {
+        media_id: mediaId,
+        storage_path: storagePath
+      }
+    );
+  }
+
+  return stored;
+}
 
 async function getAuthorisedWhatsappUser(waId) {
 
@@ -348,7 +580,11 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         `Session set: ${session.entity_ref}`,
         session
       );
+      const hasMedia =
+  Number(NumMedia || 0) > 0;
 
+const hasOperationalContent =
+  hasMedia || !isBareWhSelector(Body);
 
       const reply = makeReply(
         `${whRef} selected. Send or forward messages, photos or documents for this consignment.`
@@ -394,6 +630,11 @@ app.post("/webhooks/whatsapp", async (req, res) => {
     activeSession.entity_ref,
     WaId
   );
+  const storedMedia =
+  await storeMediaForMessage(
+    messageId,
+    req.body
+  );
 
   await operationsDb.query(
     `
@@ -406,9 +647,18 @@ app.post("/webhooks/whatsapp", async (req, res) => {
     [activeSession.session_id]
   );
 
-  const reply = makeReply(
-    `${activeSession.entity_ref}: message saved.`
-  );
+ let acknowledgement =
+  `${activeSession.entity_ref}: message saved.`;
+
+if (storedMedia.length > 0) {
+  acknowledgement =
+    `${activeSession.entity_ref}: ` +
+    `${storedMedia.length} media item` +
+    `${storedMedia.length === 1 ? "" : "s"} saved.`;
+}
+
+const reply =
+  makeReply(acknowledgement);
 
   return res
     .status(200)
