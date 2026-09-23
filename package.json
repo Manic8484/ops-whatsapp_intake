@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node index.js"
   },
-  "dependencies": {
+   "dependencies": {
+    "@google-cloud/storage": "^7.17.0",
     "express": "^5.1.0",
     "pg": "^8.16.0",
     "twilio": "^5.0.0"
