@@ -124,27 +124,55 @@ function isBareWhSelector(text) {
 }
 
 async function downloadTwilioMedia(mediaUrl) {
-
   const credentials = Buffer.from(
     `${twilioApiKeySid}:${twilioApiKeySecret}`
   ).toString("base64");
 
-  const response = await fetch(mediaUrl, {
-    headers: {
-      Authorization: `Basic ${credentials}`
-    }
-  });
+  // Retry because Twilio can deliver the webhook slightly
+  // before the media resource is available.
+  const delays = [0, 500, 1500, 3000];
 
-  if (!response.ok) {
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+
+    if (delays[attempt] > 0) {
+      await new Promise(resolve =>
+        setTimeout(resolve, delays[attempt])
+      );
+    }
+
+    const response = await fetch(mediaUrl, {
+      headers: {
+        Authorization: `Basic ${credentials}`
+      }
+    });
+
+    if (response.ok) {
+      return Buffer.from(
+        await response.arrayBuffer()
+      );
+    }
+
+    if (
+      response.status === 404 &&
+      attempt < delays.length - 1
+    ) {
+      console.warn(
+        `Twilio media not ready. ` +
+        `Retry ${attempt + 1}/${delays.length - 1}`
+      );
+
+      continue;
+    }
+
     throw new Error(
-      `Twilio media download failed: ${response.status} ${response.statusText}`
+      `Twilio media download failed: ` +
+      `${response.status} ${response.statusText}`
     );
   }
 
-  const buffer =
-    Buffer.from(await response.arrayBuffer());
-
-  return buffer;
+  throw new Error(
+    "Twilio media download failed after retries."
+  );
 }
 
 async function storeMediaForMessage(messageId, reqBody) {
@@ -645,14 +673,26 @@ if (storedMedia.length > 0) {
     `${whRef}: message saved.`;
 }
 
-const reply =
-  makeReply(acknowledgement);
+console.log(
+  `Saved to ${activeSession.entity_ref}:`,
+  {
+    messageId,
+    mediaCount: storedMedia.length,
+    messageType: MessageType
+  }
+);
+
+// No WhatsApp acknowledgement for ordinary content.
+// Returning empty TwiML prevents OpsBot flooding the chat
+// when several forwarded images arrive separately.
 
 return res
   .status(200)
   .type("text/xml")
-  .send(reply);
-    }
+  .send(
+    new twilio.twiml.MessagingResponse()
+      .toString()
+  );
 
 
     // ------------------------------------------------
