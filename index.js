@@ -43,8 +43,8 @@ const mediaBucketName =
 
 const mediaBucket = storage.bucket(mediaBucketName);
 
-
-});
+const twilioApiKeySid = process.env.TWILIO_API_KEY_SID;
+const twilioApiKeySecret = process.env.TWILIO_API_KEY_SECRET;
 
 
 // ----------------------------------------------------
