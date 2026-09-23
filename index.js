@@ -503,6 +503,42 @@ async function linkMessageToEntity(messageId, entityType, entityRef, linkedBy) {
   );
 }
 
+async function linkRecentPendingMessages(waId, entityType, entityRef, linkedBy) {
+  const result = await operationsDb.query(
+    `
+      INSERT INTO comms.message_link
+      (
+        message_id,
+        entity_type,
+        entity_ref,
+        linked_by
+      )
+      SELECT
+        m.message_id,
+        $2,
+        $3,
+        $4
+      FROM comms.message m
+      WHERE m.source_type = 'WHATSAPP'
+        AND m.source_user_id = $1
+        AND m.is_forwarded = true
+        AND m.received_ts >= now() - interval '15 seconds'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM comms.message_link ml
+          WHERE ml.message_id = m.message_id
+        )
+      ON CONFLICT (message_id, entity_type, entity_ref)
+      DO NOTHING
+      RETURNING message_id
+    `,
+    [waId, entityType, entityRef, linkedBy]
+  );
+
+  return result.rowCount;
+}
+
+
 // ----------------------------------------------------
 // HEALTH CHECK
 // ----------------------------------------------------
@@ -523,282 +559,285 @@ app.post("/webhooks/whatsapp", async (req, res) => {
 
   const {
     MessageSid,
-    From,
-    To,
     Body,
     NumMedia,
     ProfileName,
     WaId,
     MessageType,
-    Forwarded,
-    FrequentlyForwarded
+    Forwarded
   } = req.body;
 
   try {
 
-    // ------------------------------------------------
     // 1. WHITELIST
-    // ------------------------------------------------
-
     const user = await getAuthorisedWhatsappUser(WaId);
 
     if (!user) {
-
-      console.warn(
-        `Rejected unauthorised WhatsApp user: ${WaId}`
-      );
+      console.warn(`Rejected unauthorised WhatsApp user: ${WaId}`);
 
       const reply = makeReply(
         "This WhatsApp number is not authorised to use US OpsBot."
       );
 
-      return res
-        .status(200)
-        .type("text/xml")
-        .send(reply);
+      return res.status(200).type("text/xml").send(reply);
     }
 
+    console.log(`Authorised user: ${user.display_name || WaId}`);
 
-    console.log(
-      `Authorised user: ${user.display_name || WaId}`
-    );
-
-
-    // ------------------------------------------------
     // 2. LOOK FOR EXPLICIT WH REFERENCE
-    // ------------------------------------------------
-
     const whRef = extractWhRef(Body);
 
     if (whRef) {
-
       console.log(`WH reference detected: ${whRef}`);
-
-      // ----------------------------------------------
-      // 3. VALIDATE AGAINST WAREHOUSE DATABASE
-      // ----------------------------------------------
 
       const warehouse = await findWarehouseRef(whRef);
 
       if (!warehouse) {
-
         console.log(`WH not found: ${whRef}`);
 
         const reply = makeReply(
           `I can't find ${whRef}. Please check the WH reference and try again.`
         );
 
-        return res
-          .status(200)
-          .type("text/xml")
-          .send(reply);
+        return res.status(200).type("text/xml").send(reply);
       }
 
+      const session = await setWhatsappSession(WaId, whRef);
 
-      // ----------------------------------------------
-      // 4. CREATE / UPDATE SESSION
-      // ----------------------------------------------
+      console.log(`Session set: ${session.entity_ref}`, session);
 
-      const session = await setWhatsappSession(
+      const recoveredPending = await linkRecentPendingMessages(
         WaId,
-        whRef
+        "WH",
+        whRef,
+        WaId
+      );
+
+      if (recoveredPending > 0) {
+        console.log(
+          `Linked ${recoveredPending} recent pending message(s) to ${whRef}`
+        );
+      }
+
+      const hasMedia = Number(NumMedia || 0) > 0;
+      const hasOperationalContent =
+        hasMedia || !isBareWhSelector(Body);
+
+      // Bare "WH-123" is only a selector.
+      if (!hasOperationalContent) {
+        let selectionText =
+          `${whRef} selected. Send or forward messages, photos or documents for this consignment.`;
+
+        if (recoveredPending > 0) {
+          selectionText =
+            `${whRef} selected. ${recoveredPending} earlier forwarded item` +
+            `${recoveredPending === 1 ? " was" : "s were"} also linked.`;
+        }
+
+        const reply = makeReply(selectionText);
+        return res.status(200).type("text/xml").send(reply);
+      }
+
+      // WH reference plus text/media: save this content too.
+      const messageId = await storeMessage({
+        sourceType: "WHATSAPP",
+        provider: "TWILIO",
+        externalMessageId: MessageSid,
+        sourceUserId: WaId,
+        sourceDisplayName: ProfileName,
+        messageType: MessageType,
+        messageText: Body,
+        isForwarded:
+          Forwarded === "true"
+            ? true
+            : Forwarded === "false"
+            ? false
+            : null,
+        rawPayload: req.body
+      });
+
+      await linkMessageToEntity(
+        messageId,
+        "WH",
+        whRef,
+        WaId
+      );
+
+      const storedMedia = await storeMediaForMessage(
+        messageId,
+        req.body
       );
 
       console.log(
-        `Session set: ${session.entity_ref}`,
-        session
+        `Saved to ${whRef}:`,
+        {
+          messageId,
+          mediaCount: storedMedia.length,
+          messageType: MessageType,
+          recoveredPending
+        }
       );
-      const hasMedia =
-  Number(NumMedia || 0) > 0;
 
-const hasOperationalContent =
-  hasMedia || !isBareWhSelector(Body);
+      let acknowledgement;
 
+      if (storedMedia.length > 0) {
+        acknowledgement =
+          `${whRef}: ${storedMedia.length} media item` +
+          `${storedMedia.length === 1 ? "" : "s"} saved.`;
+      } else {
+        acknowledgement = `${whRef}: message saved.`;
+      }
 
-// Bare "WH-123" is only a selector.
-if (!hasOperationalContent) {
+      if (recoveredPending > 0) {
+        acknowledgement +=
+          ` ${recoveredPending} earlier forwarded item` +
+          `${recoveredPending === 1 ? " was" : "s were"} also linked.`;
+      }
 
-  const reply = makeReply(
-    `${whRef} selected. Send or forward messages, photos or documents for this consignment.`
-  );
-
-  return res
-    .status(200)
-    .type("text/xml")
-    .send(reply);
-}
-
-
-// WH reference plus text/media:
-// select the WH AND save the content.
-
-const messageId = await storeMessage({
-  sourceType: "WHATSAPP",
-  provider: "TWILIO",
-  externalMessageId: MessageSid,
-  sourceUserId: WaId,
-  sourceDisplayName: ProfileName,
-  messageType: MessageType,
-  messageText: Body,
-  isForwarded:
-    Forwarded === "true"
-      ? true
-      : Forwarded === "false"
-      ? false
-      : null,
-  rawPayload: req.body
-});
-
-await linkMessageToEntity(
-  messageId,
-  "WH",
-  whRef,
-  WaId
-);
-
-const storedMedia =
-  await storeMediaForMessage(
-    messageId,
-    req.body
-  );
-
-let acknowledgement;
-
-if (storedMedia.length > 0) {
-  acknowledgement =
-    `${whRef}: ${storedMedia.length} media item` +
-    `${storedMedia.length === 1 ? "" : "s"} saved.`;
-} else {
-  acknowledgement =
-    `${whRef}: message saved.`;
-}
-
-console.log(
-  `Saved to ${whRef}:`,
-  {
-    messageId,
-    mediaCount: storedMedia.length,
-    messageType: MessageType
-  }
-);
-
-const reply = makeReply(acknowledgement);
-
-return res
-  .status(200)
-  .type("text/xml")
-  .send(reply);
-
+      const reply = makeReply(acknowledgement);
+      return res.status(200).type("text/xml").send(reply);
     }
 
-
-    // ------------------------------------------------
-    // 5. NO WH IN MESSAGE - CHECK EXISTING SESSION
-    // ------------------------------------------------
-
-    const activeSession =
-      await getActiveWhatsappSession(WaId);
-
+    // 3. NO WH IN MESSAGE - CHECK EXISTING SESSION
+    const activeSession = await getActiveWhatsappSession(WaId);
 
     if (activeSession) {
+      const messageId = await storeMessage({
+        sourceType: "WHATSAPP",
+        provider: "TWILIO",
+        externalMessageId: MessageSid,
+        sourceUserId: WaId,
+        sourceDisplayName: ProfileName,
+        messageType: MessageType,
+        messageText: Body,
+        isForwarded:
+          Forwarded === "true"
+            ? true
+            : Forwarded === "false"
+            ? false
+            : null,
+        rawPayload: req.body
+      });
 
-  const messageId = await storeMessage({
-    sourceType: "WHATSAPP",
-    provider: "TWILIO",
-    externalMessageId: MessageSid,
-    sourceUserId: WaId,
-    sourceDisplayName: ProfileName,
-    messageType: MessageType,
-    messageText: Body,
-    isForwarded:
-      Forwarded === "true"
-        ? true
-        : Forwarded === "false"
-        ? false
-        : null,
-    rawPayload: req.body
-  });
+      await linkMessageToEntity(
+        messageId,
+        activeSession.entity_type,
+        activeSession.entity_ref,
+        WaId
+      );
 
-  await linkMessageToEntity(
-    messageId,
-    activeSession.entity_type,
-    activeSession.entity_ref,
-    WaId
-  );
-  const storedMedia =
-  await storeMediaForMessage(
-    messageId,
-    req.body
-  );
+      const storedMedia = await storeMediaForMessage(
+        messageId,
+        req.body
+      );
 
-  await operationsDb.query(
-    `
-      UPDATE comms.session
-      SET
-        last_activity_ts = now(),
-        expires_ts = now() + interval '30 minutes'
-      WHERE session_id = $1
-    `,
-    [activeSession.session_id]
-  );
+      await operationsDb.query(
+        `
+          UPDATE comms.session
+          SET
+            last_activity_ts = now(),
+            expires_ts = now() + interval '30 minutes'
+          WHERE session_id = $1
+        `,
+        [activeSession.session_id]
+      );
 
-  console.log(
-    `Saved to ${activeSession.entity_ref}:`,
-    {
-      messageId,
-      mediaCount: storedMedia.length,
-      messageType: MessageType
+      console.log(
+        `Saved to ${activeSession.entity_ref}:`,
+        {
+          messageId,
+          mediaCount: storedMedia.length,
+          messageType: MessageType
+        }
+      );
+
+      // Save silently so multi-photo forwards do not spam the chat.
+      return res
+        .status(200)
+        .type("text/xml")
+        .send(new twilio.twiml.MessagingResponse().toString());
     }
-  );
 
-  // No WhatsApp acknowledgement for ordinary content.
-  // Returning empty TwiML prevents OpsBot flooding the chat
-  // when several forwarded images arrive separately.
-  return res
-    .status(200)
-    .type("text/xml")
-    .send(
-      new twilio.twiml.MessagingResponse()
-        .toString()
-    );
-}
+    // 4. NO WH AND NO ACTIVE SESSION
+    const isForwarded = Forwarded === "true";
 
+    if (isForwarded) {
+      // Store now, even without a WH, so media arriving before the
+      // selector is not lost.
+      const messageId = await storeMessage({
+        sourceType: "WHATSAPP",
+        provider: "TWILIO",
+        externalMessageId: MessageSid,
+        sourceUserId: WaId,
+        sourceDisplayName: ProfileName,
+        messageType: MessageType,
+        messageText: Body,
+        isForwarded: true,
+        rawPayload: req.body
+      });
 
-    // ------------------------------------------------
-    // 6. NO WH AND NO ACTIVE SESSION
-    // ------------------------------------------------
+      const storedMedia = await storeMediaForMessage(
+        messageId,
+        req.body
+      );
+
+      // Re-check after saving in case the WH selector arrived while
+      // this webhook was downloading the media.
+      const sessionAfterSave = await getActiveWhatsappSession(WaId);
+
+      if (sessionAfterSave) {
+        await linkMessageToEntity(
+          messageId,
+          sessionAfterSave.entity_type,
+          sessionAfterSave.entity_ref,
+          WaId
+        );
+
+        console.log(
+          `Pending message caught up to ${sessionAfterSave.entity_ref}:`,
+          {
+            messageId,
+            mediaCount: storedMedia.length,
+            messageType: MessageType
+          }
+        );
+
+        return res
+          .status(200)
+          .type("text/xml")
+          .send(new twilio.twiml.MessagingResponse().toString());
+      }
+
+      console.log(
+        "Stored forwarded item pending WH reference:",
+        {
+          messageId,
+          mediaCount: storedMedia.length,
+          messageType: MessageType
+        }
+      );
+
+      const reply = makeReply(
+        "Received. Please send the WH reference, for example WH-123."
+      );
+
+      return res.status(200).type("text/xml").send(reply);
+    }
 
     const reply = makeReply(
       "Please send a WH reference first, for example WH-123."
     );
 
-    return res
-      .status(200)
-      .type("text/xml")
-      .send(reply);
-
+    return res.status(200).type("text/xml").send(reply);
 
   } catch (error) {
-
-    console.error(
-      "US OpsBot webhook error:",
-      error
-    );
-
-    /*
-      We deliberately return 200 to Twilio here so that
-      a DB/configuration fault does not generate repeated
-      webhook retries while we're testing.
-    */
+    console.error("US OpsBot webhook error:", error);
 
     const reply = makeReply(
       "Sorry, US OpsBot couldn't process that message. Please try again."
     );
 
-    return res
-      .status(200)
-      .type("text/xml")
-      .send(reply);
+    return res.status(200).type("text/xml").send(reply);
   }
 });
 
