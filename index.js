@@ -641,6 +641,37 @@ app.get("/", (req, res) => {
   res.status(200).send("US OpsBot WhatsApp intake running");
 });
 
+//   --------------------------------------------------
+//  Get media
+//   --------------------------------------------------
+
+const result = await operationsDb.query(
+  `
+    SELECT
+        med.media_id,
+        med.message_id,
+        med.mime_type,
+        med.storage_path,
+        med.thumb_storage_path,
+        med.thumb_status,
+        msg.message_text,
+        msg.source_display_name,
+        msg.received_ts AS media_ts
+    FROM comms.message_link ml
+    JOIN comms.message msg
+      ON msg.message_id = ml.message_id
+    JOIN comms.media med
+      ON med.message_id = msg.message_id
+    WHERE ml.entity_type = 'WH'
+      AND upper(ml.entity_ref) = upper($1)
+      AND msg.is_enabled = true
+      AND med.is_enabled = true
+      AND med.mime_type LIKE 'image/%'
+    ORDER BY msg.received_ts, med.media_id
+  `,
+  [wh_ref]
+);
+
 
 // ----------------------------------------------------
 // WHATSAPP WEBHOOK
