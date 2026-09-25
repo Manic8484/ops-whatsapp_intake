@@ -641,37 +641,121 @@ app.get("/", (req, res) => {
   res.status(200).send("US OpsBot WhatsApp intake running");
 });
 
-//   --------------------------------------------------
-//  Get media
-//   --------------------------------------------------
+// ----------------------------------------------------
+// REPORTING - WHATSAPP MEDIA
+// ----------------------------------------------------
 
-const result = await operationsDb.query(
-  `
-    SELECT
-        med.media_id,
-        med.message_id,
-        med.mime_type,
-        med.storage_path,
-        med.thumb_storage_path,
-        med.thumb_status,
-        msg.message_text,
-        msg.source_display_name,
-        msg.received_ts AS media_ts
-    FROM comms.message_link ml
-    JOIN comms.message msg
-      ON msg.message_id = ml.message_id
-    JOIN comms.media med
-      ON med.message_id = msg.message_id
-    WHERE ml.entity_type = 'WH'
-      AND upper(ml.entity_ref) = upper($1)
-      AND msg.is_enabled = true
-      AND med.is_enabled = true
-      AND med.mime_type LIKE 'image/%'
-    ORDER BY msg.received_ts, med.media_id
-  `,
-  [wh_ref]
-);
+app.get("/v1/reporting/whatsapp-media", async (req, res) => {
 
+  try {
+
+    const { wh_ref } = req.query;
+
+    if (!wh_ref) {
+      return res.status(400).json({
+        status: "error",
+        message: "wh_ref required"
+      });
+    }
+
+    const result = await operationsDb.query(
+      `
+        SELECT
+            med.media_id,
+            med.message_id,
+            med.mime_type,
+            med.storage_path,
+            med.thumb_storage_path,
+            med.thumb_status,
+            msg.message_text,
+            msg.source_display_name,
+            msg.received_ts AS media_ts
+        FROM comms.message_link ml
+        JOIN comms.message msg
+          ON msg.message_id = ml.message_id
+        JOIN comms.media med
+          ON med.message_id = msg.message_id
+        WHERE ml.entity_type = 'WH'
+          AND upper(ml.entity_ref) = upper($1)
+          AND msg.is_enabled = true
+          AND med.is_enabled = true
+          AND med.mime_type LIKE 'image/%'
+        ORDER BY msg.received_ts, med.media_id
+      `,
+      [wh_ref]
+    );
+
+    const media = await Promise.all(
+      result.rows.map(async row => {
+
+        const [fullUrl] =
+          await mediaBucket
+            .file(row.storage_path)
+            .getSignedUrl({
+              version: "v4",
+              action: "read",
+              expires: Date.now() + 60 * 60 * 1000
+            });
+
+        let thumbUrl = fullUrl;
+
+        if (
+          row.thumb_status === "READY" &&
+          row.thumb_storage_path
+        ) {
+          try {
+
+            const [signedThumbUrl] =
+              await mediaBucket
+                .file(row.thumb_storage_path)
+                .getSignedUrl({
+                  version: "v4",
+                  action: "read",
+                  expires: Date.now() + 60 * 60 * 1000
+                });
+
+            thumbUrl = signedThumbUrl;
+
+          } catch (err) {
+
+            console.warn(
+              `Thumbnail URL failed for ${row.media_id}; using original`
+            );
+          }
+        }
+
+        return {
+          media_id: row.media_id,
+          source: "WHATSAPP",
+          media_ts: row.media_ts,
+          thumb_url: thumbUrl,
+          full_url: fullUrl,
+          caption: row.message_text || null,
+          uploaded_by: row.source_display_name || null
+        };
+      })
+    );
+
+    res.json({
+      status: "ok",
+      wh_ref,
+      media
+    });
+
+  } catch (err) {
+
+    console.error(
+      "WhatsApp reporting media error:",
+      err
+    );
+
+    res.status(500).json({
+      status: "error",
+      message: "whatsapp_media_failed"
+    });
+  }
+
+});
 
 // ----------------------------------------------------
 // WHATSAPP WEBHOOK
