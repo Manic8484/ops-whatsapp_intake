@@ -3,6 +3,7 @@ import pg from "pg";
 import twilio from "twilio";
 import { Storage } from "@google-cloud/storage";
 import crypto from "crypto";
+import sharp from "sharp";
 
 const { Pool } = pg;
 
@@ -175,6 +176,71 @@ async function downloadTwilioMedia(mediaUrl) {
   );
 }
 
+async function createWhatsappThumbnail({
+  contents,
+  mimeType,
+  year,
+  month,
+  messageId,
+  mediaId
+}) {
+
+  if (!mimeType?.startsWith("image/")) {
+    return {
+      thumbStoragePath: null,
+      thumbStatus: "SKIPPED"
+    };
+  }
+
+  const thumbStoragePath =
+    `whatsapp/${year}/${month}/${messageId}/thumb/${mediaId}.jpg`;
+
+  try {
+
+    const thumbBuffer = await sharp(contents)
+      .rotate()
+      .resize({
+        width: 400,
+        withoutEnlargement: true
+      })
+      .jpeg({
+        quality: 70
+      })
+      .toBuffer();
+
+    await mediaBucket
+      .file(thumbStoragePath)
+      .save(thumbBuffer, {
+        resumable: false,
+        contentType: "image/jpeg",
+        metadata: {
+          contentType: "image/jpeg",
+          metadata: {
+            source: "WHATSAPP",
+            derivative: "THUMBNAIL"
+          }
+        }
+      });
+
+    return {
+      thumbStoragePath,
+      thumbStatus: "READY"
+    };
+
+  } catch (err) {
+
+    console.error(
+      `WhatsApp thumbnail generation failed for ${mediaId}:`,
+      err
+    );
+
+    return {
+      thumbStoragePath: null,
+      thumbStatus: "FAILED"
+    };
+  }
+}
+
 async function storeMediaForMessage(messageId, reqBody) {
 
   const numMedia =
@@ -275,51 +341,79 @@ async function storeMediaForMessage(messageId, reqBody) {
           }
         }
       });
+	  
+	  const {
+	  thumbStoragePath,
+	  thumbStatus
+	} = await createWhatsappThumbnail({
+	  contents,
+	  mimeType,
+	  year,
+	  month,
+	  messageId,
+	  mediaId
+	});
 
 
     const result =
-      await operationsDb.query(
-        `
-          INSERT INTO comms.media
-          (
-              media_id,
-              message_id,
-              external_media_id,
-              mime_type,
-              storage_path
-          )
-          VALUES
-          (
-              $1,
-              $2,
-              $3,
-              $4,
-              $5
-          )
+  await operationsDb.query(
+    `
+      INSERT INTO comms.media
+      (
+          media_id,
+          message_id,
+          external_media_id,
+          mime_type,
+          storage_path,
+          thumb_storage_path,
+          thumb_status,
+          thumb_created_ts
+      )
+      VALUES
+      (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5,
+          $6,
+          $7,
+          CASE
+            WHEN $7 = 'READY'
+            THEN now()
+            ELSE NULL
+          END
+      )
 
-          ON CONFLICT
-              (message_id, external_media_id)
-          DO NOTHING
+      ON CONFLICT
+          (message_id, external_media_id)
+      DO NOTHING
 
-          RETURNING
-              media_id,
-              storage_path
-        `,
-        [
-          mediaId,
-          messageId,
-          externalMediaId,
-          mimeType,
-          storagePath
-        ]
-      );
+      RETURNING
+          media_id,
+          storage_path,
+          thumb_storage_path,
+          thumb_status
+    `,
+    [
+      mediaId,
+      messageId,
+      externalMediaId,
+      mimeType,
+      storagePath,
+      thumbStoragePath,
+      thumbStatus
+    ]
+  );
 
     stored.push(
-      result.rows[0] || {
-        media_id: mediaId,
-        storage_path: storagePath
-      }
-    );
+	result.rows[0] || {
+    media_id: mediaId,
+    storage_path: storagePath,
+    thumb_storage_path: thumbStoragePath,
+    thumb_status: thumbStatus
+  }
+	);
   }
 
   return stored;
