@@ -69,6 +69,36 @@ function extractWhRef(text) {
 }
 
 
+
+function extractFreedomJobRef(text) {
+  if (!text) return null;
+
+  // Freedom references are currently six digits, e.g. 861955.
+  // WH references are handled before this function is consulted.
+  const match = String(text).match(/\b(\d{6})\b/);
+  return match ? match[1] : null;
+}
+
+function isBareFreedomJobSelector(text, jobRef) {
+  if (!text || !jobRef) return false;
+
+  const remainder = String(text)
+    .replace(new RegExp(`\\b${jobRef}\\b`), "")
+    .replace(/[\s:;,\.\-–—]+/g, "")
+    .trim();
+
+  return remainder.length === 0;
+}
+
+function freedomJobNoteText(text, jobRef) {
+  if (!text) return "";
+
+  return String(text)
+    .replace(new RegExp(`\\b${jobRef}\\b`), "")
+    .replace(/^[\s:;,\.\-–—]+/, "")
+    .trim();
+}
+
 function makeReply(text) {
   const response = new twilio.twiml.MessagingResponse();
 
@@ -243,177 +273,142 @@ async function createWhatsappThumbnail({
 
 async function storeMediaForMessage(messageId, reqBody) {
 
-  const numMedia =
-    Number(reqBody.NumMedia || 0);
-
+  const numMedia = Number(reqBody.NumMedia || 0);
   const stored = [];
 
   for (let i = 0; i < numMedia; i++) {
 
-    const mediaUrl =
-      reqBody[`MediaUrl${i}`];
-
+    const mediaUrl = reqBody[`MediaUrl${i}`];
     const mimeType =
       reqBody[`MediaContentType${i}`] ||
       "application/octet-stream";
 
-    if (!mediaUrl) {
-      continue;
-    }
+    if (!mediaUrl) continue;
 
-    const externalMediaId =
-      mediaIdFromUrl(mediaUrl);
+    const externalMediaId = mediaIdFromUrl(mediaUrl);
 
-    // Has this Twilio media item already been stored?
-    const existing =
-      await operationsDb.query(
-        `
-          SELECT
-              media_id,
-              storage_path
-          FROM comms.media
-          WHERE message_id = $1
-            AND external_media_id = $2
-          LIMIT 1
-        `,
-        [
-          messageId,
-          externalMediaId
-        ]
-      );
+    const existing = await operationsDb.query(
+      `
+        SELECT
+            media_id,
+            external_media_id,
+            mime_type,
+            storage_path,
+            thumb_storage_path,
+            thumb_status
+        FROM comms.media
+        WHERE message_id = $1
+          AND external_media_id = $2
+        LIMIT 1
+      `,
+      [messageId, externalMediaId]
+    );
 
     if (existing.rows[0]) {
+      console.log(`Media already stored: ${externalMediaId}`);
 
-      console.log(
-        `Media already stored: ${externalMediaId}`
-      );
+      const row = existing.rows[0];
+      const [contents] = await mediaBucket.file(row.storage_path).download();
+      const extension = extensionForMimeType(row.mime_type || mimeType);
 
-      stored.push(existing.rows[0]);
-
+      stored.push({
+        ...row,
+        byte_size: contents.length,
+        content_sha256: crypto.createHash("sha256").update(contents).digest("hex"),
+        original_filename: `whatsapp-${externalMediaId || row.media_id}${extension}`
+      });
       continue;
     }
 
-
-    const mediaId =
-      crypto.randomUUID();
-
-    const now =
-      new Date();
-
-    const year =
-      now.getUTCFullYear();
-
-    const month =
-      String(now.getUTCMonth() + 1)
-        .padStart(2, "0");
-
-    const extension =
-      extensionForMimeType(mimeType);
-
+    const mediaId = crypto.randomUUID();
+    const now = new Date();
+    const year = now.getUTCFullYear();
+    const month = String(now.getUTCMonth() + 1).padStart(2, "0");
+    const extension = extensionForMimeType(mimeType);
     const storagePath =
       `whatsapp/${year}/${month}/${messageId}/${mediaId}${extension}`;
 
+    console.log(`Downloading Twilio media: ${externalMediaId}`);
+    const contents = await downloadTwilioMedia(mediaUrl);
 
-    console.log(
-      `Downloading Twilio media: ${externalMediaId}`
-    );
-
-    const contents =
-      await downloadTwilioMedia(mediaUrl);
-
-
-    console.log(
-      `Saving media to gs://${mediaBucketName}/${storagePath}`
-    );
-
-    await mediaBucket
-      .file(storagePath)
-      .save(contents, {
-        resumable: false,
+    console.log(`Saving media to gs://${mediaBucketName}/${storagePath}`);
+    await mediaBucket.file(storagePath).save(contents, {
+      resumable: false,
+      contentType: mimeType,
+      metadata: {
         contentType: mimeType,
         metadata: {
-          contentType: mimeType,
-          metadata: {
-            source: "WHATSAPP",
-            provider: "TWILIO",
-            externalMediaId:
-              externalMediaId || ""
-          }
+          source: "WHATSAPP",
+          provider: "TWILIO",
+          externalMediaId: externalMediaId || ""
         }
+      }
+    });
+
+    const { thumbStoragePath, thumbStatus } =
+      await createWhatsappThumbnail({
+        contents,
+        mimeType,
+        year,
+        month,
+        messageId,
+        mediaId
       });
-	  
-	  const {
-	  thumbStoragePath,
-	  thumbStatus
-	} = await createWhatsappThumbnail({
-	  contents,
-	  mimeType,
-	  year,
-	  month,
-	  messageId,
-	  mediaId
-	});
 
+    const result = await operationsDb.query(
+      `
+        INSERT INTO comms.media
+        (
+            media_id,
+            message_id,
+            external_media_id,
+            mime_type,
+            storage_path,
+            thumb_storage_path,
+            thumb_status,
+            thumb_created_ts
+        )
+        VALUES
+        (
+            $1,$2,$3,$4,$5,$6,$7,
+            CASE WHEN $7 = 'READY' THEN now() ELSE NULL END
+        )
+        ON CONFLICT (message_id, external_media_id)
+        DO NOTHING
+        RETURNING
+            media_id,
+            external_media_id,
+            mime_type,
+            storage_path,
+            thumb_storage_path,
+            thumb_status
+      `,
+      [
+        mediaId,
+        messageId,
+        externalMediaId,
+        mimeType,
+        storagePath,
+        thumbStoragePath,
+        thumbStatus
+      ]
+    );
 
-    const result =
-  await operationsDb.query(
-    `
-      INSERT INTO comms.media
-      (
-          media_id,
-          message_id,
-          external_media_id,
-          mime_type,
-          storage_path,
-          thumb_storage_path,
-          thumb_status,
-          thumb_created_ts
-      )
-      VALUES
-      (
-          $1,
-          $2,
-          $3,
-          $4,
-          $5,
-          $6,
-          $7,
-          CASE
-            WHEN $7 = 'READY'
-            THEN now()
-            ELSE NULL
-          END
-      )
+    const row = result.rows[0] || {
+      media_id: mediaId,
+      external_media_id: externalMediaId,
+      mime_type: mimeType,
+      storage_path: storagePath,
+      thumb_storage_path: thumbStoragePath,
+      thumb_status: thumbStatus
+    };
 
-      ON CONFLICT
-          (message_id, external_media_id)
-      DO NOTHING
-
-      RETURNING
-          media_id,
-          storage_path,
-          thumb_storage_path,
-          thumb_status
-    `,
-    [
-      mediaId,
-      messageId,
-      externalMediaId,
-      mimeType,
-      storagePath,
-      thumbStoragePath,
-      thumbStatus
-    ]
-  );
-
-    stored.push(
-	result.rows[0] || {
-    media_id: mediaId,
-    storage_path: storagePath,
-    thumb_storage_path: thumbStoragePath,
-    thumb_status: thumbStatus
-  }
-	);
+    stored.push({
+      ...row,
+      byte_size: contents.length,
+      content_sha256: crypto.createHash("sha256").update(contents).digest("hex"),
+      original_filename: `whatsapp-${externalMediaId || mediaId}${extension}`
+    });
   }
 
   return stored;
@@ -458,7 +453,7 @@ async function findWarehouseRef(whRef) {
 }
 
 
-async function setWhatsappSession(waId, whRef) {
+async function setWhatsappEntitySession(waId, entityType, entityRef) {
 
   const result = await operationsDb.query(
     `
@@ -474,31 +469,135 @@ async function setWhatsappSession(waId, whRef) {
       (
           'WHATSAPP',
           $1,
-          'WH',
           $2,
+          $3,
           now() + interval '30 minutes'
       )
-
       ON CONFLICT (source_type, source_user_id)
-
       DO UPDATE SET
-          entity_type      = 'WH',
+          entity_type      = EXCLUDED.entity_type,
           entity_ref       = EXCLUDED.entity_ref,
           last_activity_ts = now(),
           expires_ts       = now() + interval '30 minutes'
-
       RETURNING
           session_id,
           entity_type,
           entity_ref,
           expires_ts
     `,
-    [waId, whRef]
+    [waId, entityType, entityRef]
   );
 
   return result.rows[0];
 }
 
+async function setWhatsappSession(waId, whRef) {
+  return setWhatsappEntitySession(waId, "WH", whRef);
+}
+
+async function findFreedomJob(jobRef) {
+  const result = await operationsDb.query(
+    `
+      SELECT
+          job_ref,
+          account_name,
+          vehicle_description,
+          despatch_instructions,
+          freedom_status,
+          CASE
+            WHEN NULLIF(btrim(driver_callsign), '') IS NOT NULL
+              THEN driver_callsign
+            WHEN NULLIF(btrim(agent_code), '') IS NOT NULL
+              THEN agent_code
+            ELSE NULL
+          END AS allocation_code,
+          CASE
+            WHEN NULLIF(btrim(driver_callsign), '') IS NOT NULL
+              THEN concat_ws(' ', driver_firstname, driver_lastname)
+            WHEN NULLIF(btrim(agent_code), '') IS NOT NULL
+              THEN agent_name
+            ELSE NULL
+          END AS allocation_name
+      FROM public.freedom_jobs
+      WHERE job_ref = $1
+      LIMIT 1
+    `,
+    [jobRef]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function saveFreedomJobWhatsapp({
+  jobRef,
+  messageSid,
+  waId,
+  profileName,
+  noteText,
+  rawBody,
+  storedMedia
+}) {
+  const sender = profileName
+    ? `${profileName} (${waId})`
+    : waId;
+
+  if (noteText) {
+    await operationsDb.query(
+      `
+        INSERT INTO public.job_notes
+        (
+          job_ref,
+          source,
+          source_message_id,
+          sender,
+          note_text,
+          raw_body,
+          received_at
+        )
+        VALUES ($1, 'WHATSAPP', $2, $3, $4, $5, now())
+        ON CONFLICT DO NOTHING
+      `,
+      [jobRef, messageSid, sender, noteText, rawBody || noteText]
+    );
+  }
+
+  for (const media of storedMedia || []) {
+    await operationsDb.query(
+      `
+        INSERT INTO public.job_media
+        (
+          job_ref,
+          source,
+          source_message_id,
+          source_media_id,
+          sender,
+          original_filename,
+          content_type,
+          byte_size,
+          content_sha256,
+          storage_bucket,
+          storage_object,
+          received_at
+        )
+        VALUES
+        ($1, 'WHATSAPP', $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+        ON CONFLICT DO NOTHING
+      `,
+      [
+        jobRef,
+        messageSid,
+        media.external_media_id || media.media_id,
+        sender,
+        media.original_filename || `whatsapp-${media.media_id}`,
+        media.mime_type || "application/octet-stream",
+        media.byte_size || null,
+        media.content_sha256,
+        mediaBucketName,
+        media.storage_path
+      ]
+    );
+  }
+}
 
 async function getActiveWhatsappSession(waId) {
 
@@ -642,122 +741,6 @@ app.get("/", (req, res) => {
 });
 
 // ----------------------------------------------------
-// REPORTING - WHATSAPP MEDIA
-// ----------------------------------------------------
-
-app.get("/v1/reporting/whatsapp-media", async (req, res) => {
-
-  try {
-
-    const { wh_ref } = req.query;
-
-    if (!wh_ref) {
-      return res.status(400).json({
-        status: "error",
-        message: "wh_ref required"
-      });
-    }
-
-    const result = await operationsDb.query(
-      `
-        SELECT
-            med.media_id,
-            med.message_id,
-            med.mime_type,
-            med.storage_path,
-            med.thumb_storage_path,
-            med.thumb_status,
-            msg.message_text,
-            msg.source_display_name,
-            msg.received_ts AS media_ts
-        FROM comms.message_link ml
-        JOIN comms.message msg
-          ON msg.message_id = ml.message_id
-        JOIN comms.media med
-          ON med.message_id = msg.message_id
-        WHERE ml.entity_type = 'WH'
-          AND upper(ml.entity_ref) = upper($1)
-          AND msg.is_enabled = true
-          AND med.is_enabled = true
-          AND med.mime_type LIKE 'image/%'
-        ORDER BY msg.received_ts, med.media_id
-      `,
-      [wh_ref]
-    );
-
-    const media = await Promise.all(
-      result.rows.map(async row => {
-
-        const [fullUrl] =
-          await mediaBucket
-            .file(row.storage_path)
-            .getSignedUrl({
-              version: "v4",
-              action: "read",
-              expires: Date.now() + 60 * 60 * 1000
-            });
-
-        let thumbUrl = fullUrl;
-
-        if (
-          row.thumb_status === "READY" &&
-          row.thumb_storage_path
-        ) {
-          try {
-
-            const [signedThumbUrl] =
-              await mediaBucket
-                .file(row.thumb_storage_path)
-                .getSignedUrl({
-                  version: "v4",
-                  action: "read",
-                  expires: Date.now() + 60 * 60 * 1000
-                });
-
-            thumbUrl = signedThumbUrl;
-
-          } catch (err) {
-
-            console.warn(
-              `Thumbnail URL failed for ${row.media_id}; using original`
-            );
-          }
-        }
-
-        return {
-          media_id: row.media_id,
-          source: "WHATSAPP",
-          media_ts: row.media_ts,
-          thumb_url: thumbUrl,
-          full_url: fullUrl,
-          caption: row.message_text || null,
-          uploaded_by: row.source_display_name || null
-        };
-      })
-    );
-
-    res.json({
-      status: "ok",
-      wh_ref,
-      media
-    });
-
-  } catch (err) {
-
-    console.error(
-      "WhatsApp reporting media error:",
-      err
-    );
-
-    res.status(500).json({
-      status: "error",
-      message: "whatsapp_media_failed"
-    });
-  }
-
-});
-
-// ----------------------------------------------------
 // WHATSAPP WEBHOOK
 // ----------------------------------------------------
 
@@ -777,77 +760,52 @@ app.post("/webhooks/whatsapp", async (req, res) => {
   } = req.body;
 
   try {
-
     // 1. WHITELIST
     const user = await getAuthorisedWhatsappUser(WaId);
 
     if (!user) {
       console.warn(`Rejected unauthorised WhatsApp user: ${WaId}`);
-
-      const reply = makeReply(
-        "This WhatsApp number is not authorised to use US OpsBot."
+      return res.status(200).type("text/xml").send(
+        makeReply("This WhatsApp number is not authorised to use US OpsBot.")
       );
-
-      return res.status(200).type("text/xml").send(reply);
     }
 
     console.log(`Authorised user: ${user.display_name || WaId}`);
 
-    // 2. LOOK FOR EXPLICIT WH REFERENCE
+    // 2. EXPLICIT WH REFERENCE KEEPS EXISTING WAREHOUSE BEHAVIOUR
     const whRef = extractWhRef(Body);
 
     if (whRef) {
       console.log(`WH reference detected: ${whRef}`);
 
       const warehouse = await findWarehouseRef(whRef);
-
       if (!warehouse) {
-        console.log(`WH not found: ${whRef}`);
-
-        const reply = makeReply(
-          `I can't find ${whRef}. Please check the WH reference and try again.`
+        return res.status(200).type("text/xml").send(
+          makeReply(`I can't find ${whRef}. Please check the WH reference and try again.`)
         );
-
-        return res.status(200).type("text/xml").send(reply);
       }
 
-      const session = await setWhatsappSession(WaId, whRef);
-
+      const session = await setWhatsappEntitySession(WaId, "WH", whRef);
       console.log(`Session set: ${session.entity_ref}`, session);
 
       const recoveredPending = await linkRecentPendingMessages(
-        WaId,
-        "WH",
-        whRef,
-        WaId
+        WaId, "WH", whRef, WaId
       );
 
-      if (recoveredPending > 0) {
-        console.log(
-          `Linked ${recoveredPending} recent pending message(s) to ${whRef}`
-        );
-      }
-
       const hasMedia = Number(NumMedia || 0) > 0;
-      const hasOperationalContent =
-        hasMedia || !isBareWhSelector(Body);
+      const hasOperationalContent = hasMedia || !isBareWhSelector(Body);
 
-      // Bare "WH-123" is only a selector.
       if (!hasOperationalContent) {
         let selectionText =
           `${whRef} selected. Send or forward messages, photos or documents for this consignment.`;
-
         if (recoveredPending > 0) {
           selectionText =
             `${whRef} selected. ${recoveredPending} earlier forwarded item` +
             `${recoveredPending === 1 ? " was" : "s were"} also linked.`;
         }
-
-        const reply = makeReply(selectionText);
-        return res.status(200).type("text/xml").send(reply);
+        return res.status(200).type("text/xml").send(makeReply(selectionText));
       }
 
-      // WH reference plus text/media: save this content too.
       const messageId = await storeMessage({
         sourceType: "WHATSAPP",
         provider: "TWILIO",
@@ -857,57 +815,94 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         messageType: MessageType,
         messageText: Body,
         isForwarded:
-          Forwarded === "true"
-            ? true
-            : Forwarded === "false"
-            ? false
-            : null,
+          Forwarded === "true" ? true :
+          Forwarded === "false" ? false : null,
         rawPayload: req.body
       });
 
-      await linkMessageToEntity(
-        messageId,
-        "WH",
-        whRef,
-        WaId
-      );
+      await linkMessageToEntity(messageId, "WH", whRef, WaId);
+      const storedMedia = await storeMediaForMessage(messageId, req.body);
 
-      const storedMedia = await storeMediaForMessage(
-        messageId,
-        req.body
-      );
+      const acknowledgement = storedMedia.length > 0
+        ? `${whRef}: ${storedMedia.length} media item${storedMedia.length === 1 ? "" : "s"} saved.`
+        : `${whRef}: message saved.`;
 
-      console.log(
-        `Saved to ${whRef}:`,
-        {
-          messageId,
-          mediaCount: storedMedia.length,
-          messageType: MessageType,
-          recoveredPending
-        }
-      );
-
-      let acknowledgement;
-
-      if (storedMedia.length > 0) {
-        acknowledgement =
-          `${whRef}: ${storedMedia.length} media item` +
-          `${storedMedia.length === 1 ? "" : "s"} saved.`;
-      } else {
-        acknowledgement = `${whRef}: message saved.`;
-      }
-
-      if (recoveredPending > 0) {
-        acknowledgement +=
-          ` ${recoveredPending} earlier forwarded item` +
-          `${recoveredPending === 1 ? " was" : "s were"} also linked.`;
-      }
-
-      const reply = makeReply(acknowledgement);
-      return res.status(200).type("text/xml").send(reply);
+      return res.status(200).type("text/xml").send(makeReply(acknowledgement));
     }
 
-    // 3. NO WH IN MESSAGE - CHECK EXISTING SESSION
+    // 3. EXPLICIT FREEDOM JOB REFERENCE
+    const jobRef = extractFreedomJobRef(Body);
+
+    if (jobRef) {
+      console.log(`Freedom job reference detected: ${jobRef}`);
+
+      const job = await findFreedomJob(jobRef);
+      if (!job) {
+        return res.status(200).type("text/xml").send(
+          makeReply(`I can't find Freedom job ${jobRef}. Please check the job number and try again.`)
+        );
+      }
+
+      const session = await setWhatsappEntitySession(WaId, "JOB", jobRef);
+      console.log(`Job session set: ${session.entity_ref}`, session);
+
+      const hasMedia = Number(NumMedia || 0) > 0;
+      const noteText = freedomJobNoteText(Body, jobRef);
+      const bareSelector = isBareFreedomJobSelector(Body, jobRef) && !hasMedia;
+
+      if (bareSelector) {
+        const allocation = [job.allocation_code, job.allocation_name]
+          .filter(Boolean)
+          .join(" · ");
+        const label = job.account_name === "Internal Tracking - Warehouse Account"
+          ? "Warehouse Task"
+          : "Freedom Job";
+
+        const lines = [
+          `${label} ${jobRef} selected.`,
+          allocation || "Unallocated",
+          job.despatch_instructions || job.vehicle_description || ""
+        ].filter(Boolean);
+
+        lines.push("Send or forward messages, photos or documents for this job.");
+        return res.status(200).type("text/xml").send(makeReply(lines.join("\n")));
+      }
+
+      const messageId = await storeMessage({
+        sourceType: "WHATSAPP",
+        provider: "TWILIO",
+        externalMessageId: MessageSid,
+        sourceUserId: WaId,
+        sourceDisplayName: ProfileName,
+        messageType: MessageType,
+        messageText: Body,
+        isForwarded:
+          Forwarded === "true" ? true :
+          Forwarded === "false" ? false : null,
+        rawPayload: req.body
+      });
+
+      await linkMessageToEntity(messageId, "JOB", jobRef, WaId);
+      const storedMedia = await storeMediaForMessage(messageId, req.body);
+
+      await saveFreedomJobWhatsapp({
+        jobRef,
+        messageSid: MessageSid,
+        waId: WaId,
+        profileName: ProfileName,
+        noteText,
+        rawBody: Body,
+        storedMedia
+      });
+
+      const acknowledgement = storedMedia.length > 0
+        ? `Job ${jobRef}: ${storedMedia.length} media item${storedMedia.length === 1 ? "" : "s"} saved.`
+        : `Job ${jobRef}: message saved.`;
+
+      return res.status(200).type("text/xml").send(makeReply(acknowledgement));
+    }
+
+    // 4. NO EXPLICIT REFERENCE - USE ACTIVE SESSION
     const activeSession = await getActiveWhatsappSession(WaId);
 
     if (activeSession) {
@@ -920,11 +915,8 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         messageType: MessageType,
         messageText: Body,
         isForwarded:
-          Forwarded === "true"
-            ? true
-            : Forwarded === "false"
-            ? false
-            : null,
+          Forwarded === "true" ? true :
+          Forwarded === "false" ? false : null,
         rawPayload: req.body
       });
 
@@ -935,44 +927,40 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         WaId
       );
 
-      const storedMedia = await storeMediaForMessage(
-        messageId,
-        req.body
-      );
+      const storedMedia = await storeMediaForMessage(messageId, req.body);
+
+      if (activeSession.entity_type === "JOB") {
+        await saveFreedomJobWhatsapp({
+          jobRef: activeSession.entity_ref,
+          messageSid: MessageSid,
+          waId: WaId,
+          profileName: ProfileName,
+          noteText: String(Body || "").trim(),
+          rawBody: Body,
+          storedMedia
+        });
+      }
 
       await operationsDb.query(
         `
           UPDATE comms.session
-          SET
-            last_activity_ts = now(),
-            expires_ts = now() + interval '30 minutes'
+          SET last_activity_ts = now(),
+              expires_ts = now() + interval '30 minutes'
           WHERE session_id = $1
         `,
         [activeSession.session_id]
       );
 
-      console.log(
-        `Saved to ${activeSession.entity_ref}:`,
-        {
-          messageId,
-          mediaCount: storedMedia.length,
-          messageType: MessageType
-        }
+      // Keep ordinary follow-up content quiet to avoid chat spam.
+      return res.status(200).type("text/xml").send(
+        new twilio.twiml.MessagingResponse().toString()
       );
-
-      // Save silently so multi-photo forwards do not spam the chat.
-      return res
-        .status(200)
-        .type("text/xml")
-        .send(new twilio.twiml.MessagingResponse().toString());
     }
 
-    // 4. NO WH AND NO ACTIVE SESSION
+    // 5. NO REFERENCE AND NO SESSION
     const isForwarded = Forwarded === "true";
 
     if (isForwarded) {
-      // Store now, even without a WH, so media arriving before the
-      // selector is not lost.
       const messageId = await storeMessage({
         sourceType: "WHATSAPP",
         provider: "TWILIO",
@@ -985,68 +973,23 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         rawPayload: req.body
       });
 
-      const storedMedia = await storeMediaForMessage(
-        messageId,
-        req.body
+      await storeMediaForMessage(messageId, req.body);
+
+      return res.status(200).type("text/xml").send(
+        makeReply("Received. Send either the WH reference (for example WH-123) or the Freedom job number (for example 861955).")
       );
-
-      // Re-check after saving in case the WH selector arrived while
-      // this webhook was downloading the media.
-      const sessionAfterSave = await getActiveWhatsappSession(WaId);
-
-      if (sessionAfterSave) {
-        await linkMessageToEntity(
-          messageId,
-          sessionAfterSave.entity_type,
-          sessionAfterSave.entity_ref,
-          WaId
-        );
-
-        console.log(
-          `Pending message caught up to ${sessionAfterSave.entity_ref}:`,
-          {
-            messageId,
-            mediaCount: storedMedia.length,
-            messageType: MessageType
-          }
-        );
-
-        return res
-          .status(200)
-          .type("text/xml")
-          .send(new twilio.twiml.MessagingResponse().toString());
-      }
-
-      console.log(
-        "Stored forwarded item pending WH reference:",
-        {
-          messageId,
-          mediaCount: storedMedia.length,
-          messageType: MessageType
-        }
-      );
-
-      const reply = makeReply(
-        "Received. Please send the WH reference, for example WH-123."
-      );
-
-      return res.status(200).type("text/xml").send(reply);
     }
 
-    const reply = makeReply(
-      "Please send a WH reference first, for example WH-123."
+    return res.status(200).type("text/xml").send(
+      makeReply("Send either a WH reference (for example WH-123) or a Freedom job number (for example 861955).")
     );
-
-    return res.status(200).type("text/xml").send(reply);
 
   } catch (error) {
     console.error("US OpsBot webhook error:", error);
 
-    const reply = makeReply(
-      "Sorry, US OpsBot couldn't process that message. Please try again."
+    return res.status(200).type("text/xml").send(
+      makeReply("Sorry, US OpsBot couldn't process that message. Please try again.")
     );
-
-    return res.status(200).type("text/xml").send(reply);
   }
 });
 
